@@ -17,9 +17,11 @@ class ConsistencyCT(pl.LightningModule):
     def __init__(
         self,
         denoiser_network_cfg: dict,
-        P_mean: float,
-        P_std: float,
         sigma_data: float,
+        train_num_steps: int,
+        sigma_min: float,
+        sigma_max: float,
+        rho: float,
         optim_cfg: dict,
         lr_scheduler_cfg: dict
     ):
@@ -29,12 +31,22 @@ class ConsistencyCT(pl.LightningModule):
         # denoiser network
         self.denoiser_network = instantiate(denoiser_network_cfg)
 
-        # log-normal schedule params
-        self.P_mean = P_mean
-        self.P_std = P_std
-
         # data noise level (for c_skip / c_out)
         self.sigma_data = sigma_data
+
+        # CT-specific schedule
+        self.train_num_steps = train_num_steps
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.rho = rho
+
+        # Pre-compute & register the t_steps
+        # t_i = (sigma_max^(1/ρ) + i/(N-1)*(sigma_min^(1/ρ)-sigma_max^(1/rho)))^rho
+        i = torch.arange(self.train_num_steps, dtype=torch.float32)
+        t_i = (sigma_max**(1/rho)
+               + i/(self.train_num_steps-1) * (sigma_min**(1/rho) - sigma_max**(1/rho))) ** rho
+        t_steps = torch.cat([t_i, torch.zeros(1)], dim=0)
+        self.register_buffer("t_steps", t_steps)
 
         # optimizer & scheduler configs
         self.optim_cfg = optim_cfg
@@ -42,83 +54,73 @@ class ConsistencyCT(pl.LightningModule):
 
     def forward(self, x, sigma, class_labels, **model_kwargs):
         """
-        The consistency mapping maps a noisy x at noise level sigma back toward clean data.
-        Implements the same skip/out/in parameterization as EDM:
-            D_x = c_skip * x + c_out * F_theta(c_in * x, emb(sigma), class_labels)
+        The consistency mapping f_θ(x,sigma) using the same skip/out/in
+        parameterization as EDM.
         """
-        # broadcasting shapes
         shape = [x.shape[0]] + [1] * (x.ndim - 1)
         c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
-        c_out  = sigma * self.sigma_data / torch.sqrt(sigma**2 + self.sigma_data**2)
-        c_in   = 1 / torch.sqrt(self.sigma_data**2 + sigma**2)
+        c_out = sigma * self.sigma_data / torch.sqrt(sigma**2 + self.sigma_data**2)
+        c_in = 1 / torch.sqrt(self.sigma_data**2 + sigma**2)
         c_noise = sigma.log() / 4
 
-        # apply network, passing class_labels
         F_theta = self.denoiser_network(
             (c_in.view(shape) * x),
             c_noise.flatten(),
             class_labels=class_labels,
             **model_kwargs
         )
-
-        # final consistency output
         D_x = c_skip.view(shape) * x + c_out.view(shape) * F_theta
         return D_x
 
     def training_step(self, batch, batch_idx):
         """
-        Consistency training (no teacher): sample two noise levels sigma1, sigma2 ~ LogNormal(P_mean,P_std),
-        share one eps noise, form x1,x2, and minimize || f(x1,sigma1, y) - f(x2,sigma2, y) ||^2.
+        Algorithm 3 (CT) step:
+          1. Sample i ~ Uniform{0,...,N-1}.
+          2. Sample z ~ N(0,I); form x_{t_{i+1}}, x_{t_i} from same z.
+          3. Compute student f_θ(x_{t_{i+1}}, t_{i+1}) (grad-on).
+          4. Compute "teacher" f_θ(x_{t_i}, t_i) under no_grad (stopgrad θ).
+          5. L = ||student - teacher||^2.
         """
         x0, y = batch
-        batch_size = x0.size(0)
-        device = x0.device
+        B, device = x0.size(0), x0.device
 
-        # sample two noise levels
-        sigma1 = torch.exp(self.P_mean + self.P_std * torch.randn(batch_size, device=device))
-        sigma2 = torch.exp(self.P_mean + self.P_std * torch.randn(batch_size, device=device))
+        idx = torch.randint(0, self.train_num_steps, (B,), device=device)
+        t_i   = self.t_steps[idx].view(B, *([1] * (x0.ndim - 1)))
+        t_ip1 = self.t_steps[idx + 1].view(B, *([1] * (x0.ndim - 1)))
+        z = torch.randn_like(x0)
+        x_ti = x0 + z * t_i
+        x_tip1 = x0 + z * t_ip1
 
-        # shared noise eps
-        eps = torch.randn_like(x0)
-
-        # noisy inputs at two levels
-        x1 = x0 + eps * sigma1.view(batch_size, *([1] * (x0.ndim - 1)))
-        x2 = x0 + eps * sigma2.view(batch_size, *([1] * (x0.ndim - 1)))
-
-        # model outputs (pass class labels)
-        D1 = self.forward(x1, sigma1, class_labels=y)
-        D2 = self.forward(x2, sigma2, class_labels=y)
+        with torch.no_grad():
+            D_ti = self.forward(x_ti, t_i.flatten(), class_labels=y)
+        D_tip1 = self.forward(x_tip1, t_ip1.flatten(), class_labels=y)
 
         # consistency loss
-        loss = F.mse_loss(D1, D2)
+        loss = F.mse_loss(D_ti, D_tip1)
         self.log("train_loss", loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """
-        Same as training but logs a validation consistency loss.
-        """
         x0, y = batch
-        batch_size = x0.size(0)
-        device = x0.device
+        B, device = x0.size(0), x0.device
 
-        sigma1 = torch.exp(self.P_mean + self.P_std * torch.randn(batch_size, device=device))
-        sigma2 = torch.exp(self.P_mean + self.P_std * torch.randn(batch_size, device=device))
-        eps = torch.randn_like(x0)
+        idx = torch.randint(0, self.train_num_steps, (B,), device=device)
+        t_i   = self.t_steps[idx].view(B, *([1] * (x0.ndim - 1)))
+        t_ip1 = self.t_steps[idx + 1].view(B, *([1] * (x0.ndim - 1)))
+        z = torch.randn_like(x0)
+        x_ti   = x0 + z * t_i
+        x_tip1 = x0 + z * t_ip1
 
-        x1 = x0 + eps * sigma1.view(batch_size, *([1] * (x0.ndim - 1)))
-        x2 = x0 + eps * sigma2.view(batch_size, *([1] * (x0.ndim - 1)))
+        with torch.no_grad():
+            D_ti = self.forward(x_ti, t_i.flatten(), class_labels=y)
+        D_tip1 = self.forward(x_tip1, t_ip1.flatten(), class_labels=y)
 
-        D1 = self.forward(x1, sigma1, class_labels=y)
-        D2 = self.forward(x2, sigma2, class_labels=y)
-
-        loss = F.mse_loss(D1, D2)
+        loss = F.mse_loss(D_ti, D_tip1)
         self.log("val_loss", loss, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
         optimizer = instantiate(self.optim_cfg, params=self.parameters())
-
         schedulers = [
             instantiate(s_cfg, optimizer=optimizer)
             for s_cfg in self.lr_scheduler_cfg.schedulers
@@ -128,7 +130,6 @@ class ConsistencyCT(pl.LightningModule):
             schedulers=schedulers,
             milestones=self.lr_scheduler_cfg.milestones,
         )
-
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -148,31 +149,25 @@ class ConsistencyCT(pl.LightningModule):
         sigma_min: float = 0.002,
         sigma_max: float = 80.0,
         rho: float = 7.0,
-        randn_like = torch.randn_like,
+        randn_like=torch.randn_like,
         **model_kwargs,
     ) -> torch.Tensor:
         """
-        Multistep consistency sampler (Algorithm 2 from Song et al. 2023).
-        Falls back to one-step when num_steps=1.
+        Unchanged from before: multistep consistency sampler 
+        (falls back to one-step if num_steps=1).
         """
         device = latents.device
-
-        # build noise schedule: t_0...t_{N-1}, plus final eps=0
         i = torch.arange(num_steps, device=device, dtype=latents.dtype)
-        t_steps = (sigma_max**(1/rho)
-                   + i/(num_steps-1) * (sigma_min**(1/rho) - sigma_max**(1/rho))) ** rho
-        t_steps = torch.cat([t_steps, torch.zeros_like(t_steps[:1])], dim=0)
+        t_steps = (
+            sigma_max ** (1 / rho)
+            + i / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))
+        ) ** rho
+        t_steps = torch.cat([t_steps, torch.zeros(1, device=device)], dim=0)
 
-        # initial sample: apply mapping once
-        x = self.forward(latents * t_steps[0], t_steps[0], class_labels=class_labels, **model_kwargs)
-
-        # for each intermediate noise level
+        x = self.forward(latents * t_steps[0], t_steps[0].view(1), class_labels=class_labels, **model_kwargs)
         for t in t_steps[1:-1]:
             z = randn_like(x)
             sigma_noise = torch.sqrt(torch.clamp(t**2 - sigma_min**2, min=0.0))
             x_b = x + sigma_noise * z
-
-            # apply consistency mapping with labels
-            x = self.forward(x_b, t, class_labels=class_labels, **model_kwargs)
-
+            x = self.forward(x_b, t.view(1), class_labels=class_labels, **model_kwargs)
         return x
