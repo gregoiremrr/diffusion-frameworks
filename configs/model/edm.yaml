@@ -1,0 +1,12 @@
+defaults:
+  - default
+  - /model/architecture@denoiser_network_cfg: u_net_S
+  - _self_
+
+_target_: models.EDM
+_recursive_: false
+
+P_mean: -1.2
+P_std: 1.2
+sigma_data: 0.5
+p_uncond: 0.2

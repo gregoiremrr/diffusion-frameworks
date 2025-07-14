@@ -1,0 +1,7 @@
+_target_: "src.data.ImageNet256DataModule"
+data_dir: ${paths.data_dir}
+batch_size: 64
+num_workers: 4
+image_size: 256
+val_split: 0.2
+seed: ${seed}

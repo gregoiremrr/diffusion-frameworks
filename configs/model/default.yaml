@@ -1,0 +1,18 @@
+optim_cfg:
+  _target_: torch.optim.AdamW
+  lr: 1e-4
+  weight_decay: 0.01
+
+lr_scheduler_cfg:
+  _target_: torch.optim.lr_scheduler.SequentialLR
+  optimizer: null # we’ll pass this from code, so leave it null
+  schedulers:
+    - _target_: torch.optim.lr_scheduler.LinearLR
+      start_factor: 0.01
+      total_iters: 50
+
+    - _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+      T_max: 10000
+      eta_min: 0.0
+
+  milestones: [1000]

@@ -1,0 +1,11 @@
+# Size-S: ≈ 14 M params
+_target_: models.architectures.DenoiserUNet
+
+# I/O parameters
+in_channels: 3
+num_classes: 1000
+
+# Architecture parameters
+base_channels: 64
+n_layers: 3
+emb_dim: 512
